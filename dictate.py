@@ -207,6 +207,28 @@ def notify(title: str, message: str) -> None:
         pass
 
 
+def play_chime(kind: str) -> None:
+    if sys.platform != "darwin":
+        return
+
+    sound_map = {
+        "start": "/System/Library/Sounds/Pop.aiff",
+        "stop": "/System/Library/Sounds/Tink.aiff",
+    }
+    sound_file = sound_map.get(kind)
+    if not sound_file:
+        return
+
+    try:
+        subprocess.Popen(
+            ["afplay", "-v", "0.15", sound_file],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
 def load_model() -> None:
     global model
     if model is None:
@@ -229,6 +251,7 @@ def start_recording() -> None:
     is_recording = True
     if overlay is not None:
         overlay.set_state("recording")
+    play_chime("start")
     notify("Dictation", "Recording started")
     print("Recording started. Speak now...")
 
@@ -247,6 +270,7 @@ def stop_recording_and_transcribe() -> None:
     is_transcribing = True
     if overlay is not None:
         overlay.set_state("transcribing")
+    play_chime("stop")
     notify("Dictation", "Recording stopped, transcribing")
     print("Recording stopped. Transcribing...")
 
