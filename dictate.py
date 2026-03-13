@@ -191,13 +191,37 @@ shift_r_down = False
 start_combo_armed = False
 
 
+def applescript_escape(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def notify(title: str, message: str) -> None:
     try:
+        safe_title = applescript_escape(title)
+        safe_message = applescript_escape(message)
         subprocess.run(
             [
                 "osascript",
                 "-e",
-                f'display notification "{message}" with title "{title}"',
+                f'display notification "{safe_message}" with title "{safe_title}"',
+            ],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+
+def show_dialog(title: str, message: str) -> None:
+    try:
+        safe_title = applescript_escape(title)
+        safe_message = applescript_escape(message.replace("\n", "\\n"))
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'display dialog "{safe_message}" with title "{safe_title}" buttons {{"OK"}} default button "OK"',
             ],
             check=False,
             stdout=subprocess.DEVNULL,
@@ -413,6 +437,11 @@ def ensure_accessibility_permissions() -> bool:
     print("- System Settings → Privacy & Security → Input Monitoring")
     print("Enable your terminal app (and Python interpreter if needed), then restart this script.")
     notify("Dictation", "Grant Accessibility/Input Monitoring and restart")
+    show_dialog(
+        "Dictation needs macOS permissions",
+        "Enable Accessibility and Input Monitoring for the app that launches Dictation "
+        "(Automator or Terminal) and for the Python interpreter if needed, then launch it again.",
+    )
     return False
 
 

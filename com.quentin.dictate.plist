@@ -7,7 +7,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/quentinlachaud/code/venv/bin/python</string>
+        <string>/Users/quentinlachaud/code/qispr/.venv/bin/python</string>
         <string>/Users/quentinlachaud/code/qispr/dictate.py</string>
     </array>
 
