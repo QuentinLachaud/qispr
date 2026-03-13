@@ -212,8 +212,9 @@ def play_chime(kind: str) -> None:
         return
 
     sound_map = {
-        "start": "/System/Library/Sounds/Pop.aiff",
-        "stop": "/System/Library/Sounds/Tink.aiff",
+        "start": "/System/Library/Sounds/Glass.aiff",
+        "stop": "/System/Library/Sounds/Blow.aiff"
+        # "Tink.aiff",
     }
     sound_file = sound_map.get(kind)
     if not sound_file:
