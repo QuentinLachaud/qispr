@@ -98,7 +98,7 @@ class RecordingOverlay:
                 pass
 
             try:
-                root.wm_attributes("-transparentcolor", "#000001")
+                root.wm_attributes("-transparentcolor", "#00000101")
             except Exception:
                 pass
 
@@ -277,8 +277,10 @@ def start_recording() -> None:
     if overlay is not None:
         overlay.set_state("recording")
     play_chime("start")
-    notify("Dictation", "Recording started")
-    print("Recording started. Speak now...")
+    title = "Recording..."
+    message = "Speak now."
+    notify(title, message)
+    # print(title + " " + message)
 
 
 def paste_clipboard() -> None:
@@ -296,8 +298,8 @@ def stop_recording_and_transcribe() -> None:
     if overlay is not None:
         overlay.set_state("transcribing")
     play_chime("stop")
-    notify("Dictation", "Recording stopped, transcribing")
-    print("Recording stopped. Transcribing...")
+    notify("Dictation", "transcribing")
+    print("Transcribing...")
 
     try:
         if not audio_chunks:
@@ -395,13 +397,12 @@ def on_press(key):
     elif is_right_shift(key):
         shift_r_down = True
 
-    if is_recording:
-        threading.Thread(target=stop_recording_and_transcribe, daemon=True).start()
-        return
-
     if not start_combo_armed and shift_l_down and shift_r_down:
         start_combo_armed = True
-        print("Shift+Right Shift detected. Release both keys to start recording.")
+        if is_recording:
+            print("Left Shift + Right Shift detected. Release either Shift key to stop recording.")
+        else:
+            print("Left Shift + Right Shift detected. Release either Shift key to start recording.")
 
 
 def on_release(key):
@@ -412,9 +413,12 @@ def on_release(key):
         shift_l_down = False
         shift_r_down = False
         try:
-            start_recording()
+            if is_recording:
+                threading.Thread(target=stop_recording_and_transcribe, daemon=True).start()
+            else:
+                start_recording()
         except Exception as e:
-            print(f"Error starting recording: {e}")
+            print(f"Error toggling recording: {e}")
         return
 
     if is_left_shift(key):
@@ -469,7 +473,7 @@ def main() -> None:
 
     print("Ready.")
     print("Start recording: hold Left Shift + Right Shift, then release both.")
-    print("Stop recording: press any key.")
+    print("Stop recording: hold Left Shift + Right Shift, then release either Shift key.")
     print("Transcript is copied to clipboard and auto-pasted (Cmd+V).")
     if overlay is not None:
         print("Visual indicator: red dot while recording, red ring while transcribing.")
