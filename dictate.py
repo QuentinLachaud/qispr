@@ -107,9 +107,10 @@ def overlay_pill_width(state: str, state_elapsed: float) -> float:
     if state == "recording":
         progress = 1.0 - math.exp(-state_elapsed * OVERLAY_PILL_EXPAND_SPEED)
         return OVERLAY_READY_PILL_WIDTH + (OVERLAY_ACTIVE_PILL_WIDTH - OVERLAY_READY_PILL_WIDTH) * progress
-    if state == "ready":
-        return OVERLAY_READY_PILL_WIDTH
-    return OVERLAY_ACTIVE_PILL_WIDTH
+    if state == "transcribing":
+        progress = 1.0 - math.exp(-state_elapsed * OVERLAY_PILL_CONTRACT_SPEED)
+        return OVERLAY_ACTIVE_PILL_WIDTH - (OVERLAY_ACTIVE_PILL_WIDTH - OVERLAY_READY_PILL_WIDTH) * progress
+    return OVERLAY_READY_PILL_WIDTH
 
 
 def overlay_recording_visual_elapsed(state_elapsed: float) -> float:
