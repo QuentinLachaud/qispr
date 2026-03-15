@@ -58,7 +58,7 @@ OVERLAY_READY_PILL_WIDTH = 67.0
 OVERLAY_ACTIVE_PILL_WIDTH = 116.0
 OVERLAY_PILL_EXPAND_SPEED = 26.0
 OVERLAY_PILL_CONTRACT_SPEED = 26.0
-OVERLAY_RECORDING_VISUAL_DELAY = 0.1
+OVERLAY_RECORDING_VISUAL_DELAY = 0.18
 OVERLAY_RECORDING_INTRO_MIN_SCALE = 0.22
 OVERLAY_RECORDING_INTRO_SPEED = 18.0
 OVERLAY_RECORDING_SETTLE_AMPLITUDE = 0.22
@@ -78,7 +78,7 @@ OVERLAY_STYLES = {
         "fill": "#ff453a",
     },
     "transcribing": {
-        "fill": "#ff9f0a",
+        "fill": "#30d158",
     },
 }
 
@@ -107,10 +107,9 @@ def overlay_pill_width(state: str, state_elapsed: float) -> float:
     if state == "recording":
         progress = 1.0 - math.exp(-state_elapsed * OVERLAY_PILL_EXPAND_SPEED)
         return OVERLAY_READY_PILL_WIDTH + (OVERLAY_ACTIVE_PILL_WIDTH - OVERLAY_READY_PILL_WIDTH) * progress
-    if state == "transcribing":
-        progress = 1.0 - math.exp(-state_elapsed * OVERLAY_PILL_CONTRACT_SPEED)
-        return OVERLAY_ACTIVE_PILL_WIDTH - (OVERLAY_ACTIVE_PILL_WIDTH - OVERLAY_READY_PILL_WIDTH) * progress
-    return OVERLAY_READY_PILL_WIDTH
+    if state == "ready":
+        return OVERLAY_READY_PILL_WIDTH
+    return OVERLAY_ACTIVE_PILL_WIDTH
 
 
 def overlay_recording_visual_elapsed(state_elapsed: float) -> float:
