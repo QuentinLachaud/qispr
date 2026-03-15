@@ -29,6 +29,7 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 LANGUAGE = "en"
 AUTO_PASTE = True
+ENABLE_SYSTEM_NOTIFICATIONS = False
 MIN_RECORD_SECONDS = 0.35
 LOW_INPUT_RMS_THRESHOLD = 0.00005
 INPUT_DEVICE = os.getenv("DICTATE_INPUT_DEVICE")
@@ -37,6 +38,49 @@ PREFERRED_INPUT_NAME_HINTS = [
     "airpods",
     "macbook",
 ]
+OVERLAY_WINDOW_WIDTH = 118.0
+OVERLAY_WINDOW_HEIGHT = 24.0
+OVERLAY_MARGIN_X = 14.0
+OVERLAY_MARGIN_Y = 6.0
+OVERLAY_LABEL_TEXT = "Qispr"
+OVERLAY_LABEL_FONT_NAME = "Monaco"
+OVERLAY_LABEL_FONT_SIZE = 11.0
+OVERLAY_LABEL_X = 24.0
+OVERLAY_LABEL_Y_OFFSET = -0.5
+OVERLAY_DOT_CENTER_X = 12.0
+OVERLAY_DOT_RADIUS = 4.4
+OVERLAY_CORNER_RADIUS = 12.0
+OVERLAY_BACKGROUND_FILL = "#000000"
+OVERLAY_BACKGROUND_ALPHA = 0.94
+OVERLAY_HOVER_ALPHA = 0.46
+OVERLAY_STATE_STEP_SECONDS = 1.0 / 30.0
+OVERLAY_READY_PILL_WIDTH = 67.0
+OVERLAY_ACTIVE_PILL_WIDTH = 116.0
+OVERLAY_PILL_EXPAND_SPEED = 26.0
+OVERLAY_PILL_CONTRACT_SPEED = 26.0
+OVERLAY_RECORDING_VISUAL_DELAY = 0.18
+OVERLAY_RECORDING_INTRO_MIN_SCALE = 0.22
+OVERLAY_RECORDING_INTRO_SPEED = 18.0
+OVERLAY_RECORDING_SETTLE_AMPLITUDE = 0.22
+OVERLAY_RECORDING_SETTLE_DAMPING = 8.5
+OVERLAY_RECORDING_SETTLE_FREQUENCY = 18.0
+OVERLAY_WAVE_START_X = 66.0
+OVERLAY_WAVE_DOT_COUNT = 10
+OVERLAY_WAVE_DOT_SPACING = 3.6
+OVERLAY_WAVE_MIN_RADIUS = 0.9
+OVERLAY_WAVE_MAX_RADIUS = 1.55
+OVERLAY_WAVE_MAX_OFFSET = 3.1
+OVERLAY_STYLES = {
+    "ready": {
+        "fill": "#30d158",
+    },
+    "recording": {
+        "fill": "#ff453a",
+    },
+    "transcribing": {
+        "fill": "#30d158",
+    },
+}
 
 # =========================
 # State
@@ -51,12 +95,41 @@ model = None
 active_sample_rate = SAMPLE_RATE
 active_input_device = None
 overlay = None
+overlay_lock = threading.Lock()
+overlay_event_thread = None
+
+
+def overlay_style(state: str) -> dict[str, str]:
+    return OVERLAY_STYLES.get(state, OVERLAY_STYLES["ready"])
+
+
+def overlay_pill_width(state: str, state_elapsed: float) -> float:
+    if state == "recording":
+        progress = 1.0 - math.exp(-state_elapsed * OVERLAY_PILL_EXPAND_SPEED)
+        return OVERLAY_READY_PILL_WIDTH + (OVERLAY_ACTIVE_PILL_WIDTH - OVERLAY_READY_PILL_WIDTH) * progress
+    if state == "transcribing":
+        progress = 1.0 - math.exp(-state_elapsed * OVERLAY_PILL_CONTRACT_SPEED)
+        return OVERLAY_ACTIVE_PILL_WIDTH - (OVERLAY_ACTIVE_PILL_WIDTH - OVERLAY_READY_PILL_WIDTH) * progress
+    return OVERLAY_READY_PILL_WIDTH
+
+
+def overlay_recording_visual_elapsed(state_elapsed: float) -> float:
+    return max(0.0, state_elapsed - OVERLAY_RECORDING_VISUAL_DELAY)
+
+
+def overlay_wave_visible(state: str, state_elapsed: float) -> bool:
+    if state != "recording":
+        return False
+    if overlay_recording_visual_elapsed(state_elapsed) <= 0.0:
+        return False
+    return overlay_pill_width(state, state_elapsed) >= OVERLAY_ACTIVE_PILL_WIDTH - 1.5
 
 
 class RecordingOverlay:
     def __init__(self) -> None:
         self._state_queue = Queue()
-        self._process = Process(target=self._run_overlay_process, args=(self._state_queue,), daemon=True)
+        self._event_queue = Queue()
+        self._process = Process(target=self._run_overlay_process, args=(self._state_queue, self._event_queue), daemon=True)
         self._process.start()
 
     def set_state(self, state: str) -> None:
@@ -70,6 +143,16 @@ class RecordingOverlay:
     def is_available(self) -> bool:
         return self._process.is_alive()
 
+    def get_event(self, timeout: float = 0.0) -> str | None:
+        if not self._process.is_alive():
+            return None
+        try:
+            return self._event_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+        except Exception:
+            return None
+
     def close(self) -> None:
         if not self._process.is_alive():
             return
@@ -79,34 +162,40 @@ class RecordingOverlay:
             pass
 
     @staticmethod
-    def _run_overlay_process(state_queue: Queue) -> None:
+    def _run_overlay_process(state_queue: Queue, event_queue: Queue) -> None:
         if sys.platform == "darwin":
             try:
-                RecordingOverlay._run_overlay_process_native(state_queue)
+                RecordingOverlay._run_overlay_process_native(state_queue, event_queue)
                 return
             except Exception:
                 pass
 
         try:
-            RecordingOverlay._run_overlay_process_tk(state_queue)
+            RecordingOverlay._run_overlay_process_tk(state_queue, event_queue)
         except Exception:
             return
 
     @staticmethod
-    def _run_overlay_process_native(state_queue: Queue) -> None:
+    def _run_overlay_process_native(state_queue: Queue, event_queue: Queue) -> None:
         import objc
         from AppKit import (
             NSApp,
+            NSAttributedString,
             NSApplication,
             NSApplicationActivationPolicyAccessory,
             NSBackingStoreBuffered,
             NSBezierPath,
             NSColor,
-            NSGraphicsContext,
+            NSFont,
+            NSFontAttributeName,
+            NSForegroundColorAttributeName,
             NSScreen,
             NSScreenSaverWindowLevel,
+            NSTrackingActiveAlways,
+            NSTrackingArea,
+            NSTrackingInVisibleRect,
+            NSTrackingMouseEnteredAndExited,
             NSTimer,
-            NSRoundLineCapStyle,
             NSView,
             NSWindow,
             NSWindowCollectionBehaviorCanJoinAllSpaces,
@@ -116,10 +205,13 @@ class RecordingOverlay:
         )
         from Foundation import NSMakePoint, NSMakeRect, NSObject
 
-        window_width = 74.0
-        window_height = 74.0
-        top_margin = 0.0
-        left_margin = 0.0
+        window_width = OVERLAY_WINDOW_WIDTH
+        window_height = OVERLAY_WINDOW_HEIGHT
+        top_margin = OVERLAY_MARGIN_Y
+        left_margin = OVERLAY_MARGIN_X
+        label_font = NSFont.fontWithName_size_(OVERLAY_LABEL_FONT_NAME, OVERLAY_LABEL_FONT_SIZE)
+        if label_font is None:
+            label_font = NSFont.systemFontOfSize_(OVERLAY_LABEL_FONT_SIZE)
 
         def color(hex_value: str, alpha: float = 1.0):
             red = int(hex_value[1:3], 16) / 255.0
@@ -138,235 +230,135 @@ class RecordingOverlay:
                 path.setLineWidth_(line_width)
                 path.stroke()
 
-        def draw_round_rect(x: float, y: float, width: float, height: float, radius: float, fill_color, stroke_color=None, line_width: float = 0.0):
-            if width <= 0 or height <= 0:
-                return
-            path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(NSMakeRect(x, y, width, height), radius, radius)
+        def draw_round_rect(x: float, y: float, width: float, height: float, radius: float, fill_color) -> None:
+            path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                NSMakeRect(x, y, width, height),
+                radius,
+                radius,
+            )
             fill_color.setFill()
             path.fill()
-            if stroke_color is not None and line_width > 0:
-                stroke_color.setStroke()
-                path.setLineWidth_(line_width)
-                path.stroke()
 
-        def draw_line(x1: float, y1: float, x2: float, y2: float, stroke_color, line_width: float):
-            path = NSBezierPath.bezierPath()
-            path.setLineCapStyle_(NSRoundLineCapStyle)
-            path.moveToPoint_(NSMakePoint(x1, y1))
-            path.lineToPoint_(NSMakePoint(x2, y2))
-            path.setLineWidth_(line_width)
-            stroke_color.setStroke()
-            path.stroke()
+        def draw_label(text: str, x: float, center_y: float, text_color) -> None:
+            label = NSAttributedString.alloc().initWithString_attributes_(
+                text,
+                {
+                    NSFontAttributeName: label_font,
+                    NSForegroundColorAttributeName: text_color,
+                },
+            )
+            label_size = label.size()
+            label.drawAtPoint_(NSMakePoint(x, center_y - label_size.height / 2.0 + OVERLAY_LABEL_Y_OFFSET))
 
-        def Jackdraw_clipboard_icon(cx: float, cy: float, scale: float, alpha: float):
-            body_width = 14.0 * scale
-            body_height = 16.0 * scale
-            body_x = cx - body_width / 2.0
-            body_y = cy - body_height / 2.0 - 0.8 * scale
-            clip_width = 8.0 * scale
-            clip_height = 4.3 * scale
-            clip_x = cx - clip_width / 2.0
-            clip_y = body_y + body_height - 1.5 * scale
-
-            draw_round_rect(
-                body_x,
-                body_y,
-                body_width,
-                body_height,
-                3.4 * scale,
-                color("#d2d9e1", 0.90 * alpha),
-                color("#f7fbff", 0.22 * alpha),
-                1.0,
-            )
-            draw_round_rect(
-                clip_x,
-                clip_y,
-                clip_width,
-                clip_height,
-                2.0 * scale,
-                color("#b7c1cb", 0.94 * alpha),
-                color("#edf2f7", 0.18 * alpha),
-                0.8,
-            )
-            draw_line(
-                body_x + 3.2 * scale,
-                body_y + 10.8 * scale,
-                body_x + body_width - 3.2 * scale,
-                body_y + 10.8 * scale,
-                color("#8f99a6", 0.72 * alpha),
-                1.1 * scale,
-            )
-            draw_line(
-                body_x + 3.2 * scale,
-                body_y + 7.1 * scale,
-                body_x + body_width - 4.4 * scale,
-                body_y + 7.1 * scale,
-                color("#a0aab6", 0.64 * alpha),
-                1.0 * scale,
-            )
+        def draw_wave(start_x: float, center_y: float, phase: float) -> None:
+            for index in range(OVERLAY_WAVE_DOT_COUNT):
+                envelope = 0.35 + 0.65 * math.sin((index + 1) / (OVERLAY_WAVE_DOT_COUNT + 1) * math.pi)
+                travel = phase * 1.9 - index * 0.55
+                lift = math.sin(travel) * OVERLAY_WAVE_MAX_OFFSET * envelope
+                intensity = 0.28 + 0.46 * (0.5 + 0.5 * math.sin(travel + 0.9)) * envelope
+                radius = OVERLAY_WAVE_MIN_RADIUS + (OVERLAY_WAVE_MAX_RADIUS - OVERLAY_WAVE_MIN_RADIUS) * intensity
+                draw_circle(
+                    start_x + index * OVERLAY_WAVE_DOT_SPACING,
+                    center_y + lift,
+                    radius,
+                    color("#ffffff", intensity),
+                )
 
         class OverlayView(NSView):
             def initWithFrame_(self, frame):
                 self = objc.super(OverlayView, self).initWithFrame_(frame)
                 if self is None:
                     return None
-                self.state = "hidden"
-                self.visibility = 0.0
+                self.state = "ready"
+                self.state_elapsed = 0.0
                 self.phase = 0.0
-                self.idle_hold_frames = 0
+                self.is_hovered = False
+                tracking_area = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
+                    NSMakeRect(0.0, 0.0, frame.size.width, frame.size.height),
+                    NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways | NSTrackingInVisibleRect,
+                    self,
+                    None,
+                )
+                self.addTrackingArea_(tracking_area)
                 return self
 
             def isOpaque(self):
                 return False
 
+            def acceptsFirstMouse_(self, _event):
+                return True
+
             def set_overlay_state(self, next_state: str) -> None:
-                if next_state in {"recording", "transcribing"}:
-                    self.state = next_state
-                    self.idle_hold_frames = 0
-                elif next_state == "saved":
-                    self.state = "saved"
-                    self.idle_hold_frames = 24
+                if next_state in {"ready", "recording", "transcribing"}:
+                    resolved_state = next_state
                 else:
-                    self.state = "idle"
-                    self.idle_hold_frames = 0
+                    resolved_state = "ready"
+                if resolved_state != self.state:
+                    self.state = resolved_state
+                    self.state_elapsed = 0.0
 
             def step_animation(self) -> None:
-                if self.state in {"recording", "transcribing"}:
-                    target_visibility = 1.0
-                elif self.state == "saved" and self.idle_hold_frames > 0:
-                    self.idle_hold_frames -= 1
-                    target_visibility = 1.0
-                else:
-                    target_visibility = 0.0
-                    if self.visibility < 0.03:
-                        self.state = "hidden"
-
-                if target_visibility > self.visibility:
-                    self.visibility += (target_visibility - self.visibility) * 0.20
-                else:
-                    self.visibility += (target_visibility - self.visibility) * 0.12
-
-                self.visibility = max(0.0, min(1.0, self.visibility))
+                self.state_elapsed += OVERLAY_STATE_STEP_SECONDS
                 self.phase += 0.10
                 self.setNeedsDisplay_(True)
 
+            def mouseEntered_(self, _event):
+                self.is_hovered = True
+                self.setNeedsDisplay_(True)
+
+            def mouseExited_(self, _event):
+                self.is_hovered = False
+                self.setNeedsDisplay_(True)
+
+            def mouseDown_(self, _event):
+                try:
+                    event_queue.put_nowait("toggle")
+                except Exception:
+                    pass
+
             def drawRect_(self, _dirty_rect):
-                if self.state == "hidden" and self.visibility < 0.02:
-                    return
-
-                eased_visibility = 1.0 - pow(1.0 - self.visibility, 3)
-                orb_scale = 0.16 + 0.84 * eased_visibility
+                pill_width = overlay_pill_width(self.state, self.state_elapsed)
+                dot_scale = 1.0
                 if self.state == "recording":
-                    orb_scale *= 1.0 + 0.012 * math.sin(self.phase * 1.05)
+                    visual_elapsed = overlay_recording_visual_elapsed(self.state_elapsed)
+                    intro_progress = 1.0 - math.exp(-visual_elapsed * OVERLAY_RECORDING_INTRO_SPEED)
+                    intro_scale = OVERLAY_RECORDING_INTRO_MIN_SCALE + (1.0 - OVERLAY_RECORDING_INTRO_MIN_SCALE) * intro_progress
+                    settle_scale = 1.0 + OVERLAY_RECORDING_SETTLE_AMPLITUDE * math.exp(
+                        -visual_elapsed * OVERLAY_RECORDING_SETTLE_DAMPING
+                    ) * math.sin(visual_elapsed * OVERLAY_RECORDING_SETTLE_FREQUENCY)
+                    breath_scale = 1.0 + 0.020 * math.sin(self.phase * 1.05)
+                    dot_scale *= intro_scale * settle_scale * breath_scale
                 elif self.state == "transcribing":
-                    orb_scale *= 1.0 + 0.006 * math.sin(self.phase * 0.85)
-                elif self.state == "saved":
-                    orb_scale *= 0.74
+                    dot_scale *= 1.0 + 0.012 * math.sin(self.phase * 0.75)
+                else:
+                    dot_scale *= 1.0 + 0.010 * math.sin(self.phase * 0.55)
 
-                alpha = min(0.93, pow(self.visibility, 0.86))
-                center_x = window_width / 2.0
+                style = overlay_style(self.state)
+                center_x = OVERLAY_DOT_CENTER_X
                 center_y = window_height / 2.0
-                aura_radius = 24.0 * orb_scale
-                halo_radius = 19.5 * orb_scale
-                shell_radius = 14.6 * orb_scale
-                core_radius = 8.5 * orb_scale
+                dot_radius = OVERLAY_DOT_RADIUS * dot_scale
+                background_alpha = OVERLAY_HOVER_ALPHA if self.is_hovered else OVERLAY_BACKGROUND_ALPHA
 
-                draw_circle(
-                    center_x,
-                    center_y,
-                    aura_radius + 4.5 * orb_scale,
-                    color("#020305", 0.14 * alpha),
+                draw_round_rect(
+                    0.0,
+                    0.0,
+                    pill_width,
+                    window_height,
+                    OVERLAY_CORNER_RADIUS,
+                    color(OVERLAY_BACKGROUND_FILL, background_alpha),
                 )
-                draw_circle(
-                    center_x,
-                    center_y,
-                    aura_radius,
-                    color("#0a1016", 0.22 * alpha),
-                )
-                draw_circle(
-                    center_x,
-                    center_y,
-                    halo_radius,
-                    color("#1a222d", 0.52 * alpha),
-                    color("#9ca7b5", 0.10 * alpha),
-                    1.1,
-                )
-                draw_circle(
-                    center_x,
-                    center_y,
-                    shell_radius,
-                    color("#27313d", 0.48 * alpha),
-                    color("#6f7a89", 0.10 * alpha),
-                    0.9,
-                )
-
-                if self.state == "recording":
-                    pulse = 0.5 + 0.5 * math.sin(self.phase * 1.8)
-                    draw_circle(center_x, center_y, 12.4 * orb_scale + pulse * 0.8, color("#4c0d18", 0.22 * alpha))
-                    draw_circle(center_x, center_y, 10.5 * orb_scale + pulse * 0.45, color("#701021", 0.20 * alpha))
-                    draw_circle(
-                        center_x,
-                        center_y,
-                        core_radius,
-                        color("#ba2640", 0.94 * alpha),
-                        color("#ee788a", 0.24 * alpha),
-                        0.9,
-                    )
-                    draw_circle(
-                        center_x - 2.7 * orb_scale,
-                        center_y + 2.9 * orb_scale,
-                        1.8 * orb_scale,
-                        color("#ffd9df", 0.54 * alpha),
-                    )
-                    return
-
-                if self.state == "transcribing":
-                    draw_circle(center_x, center_y, 12.2 * orb_scale, color("#48111a", 0.22 * alpha))
-                    orb_path = NSBezierPath.bezierPathWithOvalInRect_(
-                        NSMakeRect(center_x - core_radius, center_y - core_radius, core_radius * 2.0, core_radius * 2.0)
-                    )
-                    draw_circle(
-                        center_x,
-                        center_y,
-                        core_radius,
-                        color("#61121f", 0.82 * alpha),
-                        color("#d65e72", 0.24 * alpha),
-                        0.9,
-                    )
-
-                    context = NSGraphicsContext.currentContext()
-                    context.saveGraphicsState()
-                    orb_path.addClip()
-                    offsets = (-5.4, -2.7, 0.0, 2.7, 5.4)
-                    wave_colors = ("#cf5b6d", "#df7887", "#f6d8de", "#df7887", "#cf5b6d")
-                    for index, offset in enumerate(offsets):
-                        x_offset = offset * orb_scale + math.sin(self.phase * 1.25 - index * 0.8) * 0.42 * orb_scale
-                        x_position = center_x + x_offset
-                        half_limit = math.sqrt(max(core_radius * core_radius - x_offset * x_offset, 0.0)) * 0.82
-                        activity = 0.48 + 0.34 * (0.5 + 0.5 * math.sin(self.phase * 1.6 + index * 0.55))
-                        half_height = max(1.8 * orb_scale, half_limit * activity)
-                        draw_line(
-                            x_position,
-                            center_y - half_height,
-                            x_position,
-                            center_y + half_height,
-                            color(wave_colors[index], 0.88 * alpha),
-                            max(1.6, 1.8 * orb_scale),
-                        )
-                    context.restoreGraphicsState()
-                    return
-
-                if self.state == "saved":
-                    draw_circle(center_x, center_y, 10.8 * orb_scale, color("#111820", 0.24 * alpha))
-                    draw_clipboard_icon(center_x, center_y, orb_scale, alpha)
+                draw_circle(center_x, center_y, dot_radius, color(style["fill"], 0.98))
+                draw_label(OVERLAY_LABEL_TEXT, OVERLAY_LABEL_X, center_y, color("#ffffff", 0.82))
+                if overlay_wave_visible(self.state, self.state_elapsed):
+                    draw_wave(OVERLAY_WAVE_START_X, center_y, self.phase)
 
         class OverlayController(NSObject):
-            def initWithView_window_queue_(self, view, window, overlay_queue):
+            def initWithViews_windows_queue_(self, views, windows, overlay_queue):
                 self = objc.super(OverlayController, self).init()
                 if self is None:
                     return None
-                self.view = view
-                self.window = window
+                self.views = views
+                self.windows = windows
                 self.overlay_queue = overlay_queue
                 self.timer = None
                 return self
@@ -381,52 +373,65 @@ class RecordingOverlay:
                     if next_state == "__quit__":
                         if self.timer is not None:
                             self.timer.invalidate()
-                        self.window.orderOut_(None)
+                        for window in self.windows:
+                            window.orderOut_(None)
                         NSApp.terminate_(None)
                         return
 
-                    self.view.set_overlay_state(next_state)
+                    for view in self.views:
+                        view.set_overlay_state(next_state)
 
-                self.view.step_animation()
-                if self.view.state != "hidden" or self.view.visibility > 0.02:
-                    self.window.orderFrontRegardless()
+                for view in self.views:
+                    view.step_animation()
+                for window in self.windows:
+                    window.orderFrontRegardless()
 
         app = NSApplication.sharedApplication()
         app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 
-        screens = NSScreen.screens()
-        screen = screens[0] if screens else NSScreen.mainScreen()
-        visible_frame = screen.visibleFrame()
-        frame = NSMakeRect(
-            visible_frame.origin.x + left_margin,
-            visible_frame.origin.y + visible_frame.size.height - window_height - top_margin,
-            window_width,
-            window_height,
-        )
+        primary_screen = NSScreen.mainScreen()
+        if primary_screen is None:
+            screens = list(NSScreen.screens())[:1]
+        else:
+            screens = [primary_screen]
+        windows = []
+        views = []
+        for screen in screens:
+            if screen is None:
+                continue
+            visible_frame = screen.visibleFrame()
+            frame = NSMakeRect(
+                visible_frame.origin.x + left_margin,
+                visible_frame.origin.y + visible_frame.size.height - window_height - top_margin,
+                window_width,
+                window_height,
+            )
 
-        window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            frame,
-            NSWindowStyleMaskBorderless,
-            NSBackingStoreBuffered,
-            False,
-        )
-        window.setOpaque_(False)
-        window.setBackgroundColor_(NSColor.clearColor())
-        window.setHasShadow_(False)
-        window.setLevel_(NSScreenSaverWindowLevel)
-        window.setIgnoresMouseEvents_(True)
-        window.setReleasedWhenClosed_(False)
-        window.setCollectionBehavior_(
-            NSWindowCollectionBehaviorCanJoinAllSpaces
-            | NSWindowCollectionBehaviorStationary
-            | NSWindowCollectionBehaviorFullScreenAuxiliary
-        )
+            window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+                frame,
+                NSWindowStyleMaskBorderless,
+                NSBackingStoreBuffered,
+                False,
+            )
+            window.setOpaque_(False)
+            window.setBackgroundColor_(NSColor.clearColor())
+            window.setHasShadow_(False)
+            window.setLevel_(NSScreenSaverWindowLevel)
+            window.setIgnoresMouseEvents_(False)
+            window.setReleasedWhenClosed_(False)
+            window.setCollectionBehavior_(
+                NSWindowCollectionBehaviorCanJoinAllSpaces
+                | NSWindowCollectionBehaviorStationary
+                | NSWindowCollectionBehaviorFullScreenAuxiliary
+            )
 
-        view = OverlayView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, window_width, window_height))
-        window.setContentView_(view)
-        window.orderFrontRegardless()
+            view = OverlayView.alloc().initWithFrame_(NSMakeRect(0.0, 0.0, window_width, window_height))
+            window.setContentView_(view)
+            window.orderFrontRegardless()
+            windows.append(window)
+            views.append(view)
 
-        controller = OverlayController.alloc().initWithView_window_queue_(view, window, state_queue)
+        controller = OverlayController.alloc().initWithViews_windows_queue_(views, windows, state_queue)
         timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             1.0 / 30.0,
             controller,
@@ -438,17 +443,18 @@ class RecordingOverlay:
         app.run()
 
     @staticmethod
-    def _run_overlay_process_tk(state_queue: Queue) -> None:
+    def _run_overlay_process_tk(state_queue: Queue, event_queue: Queue) -> None:
         import tkinter as tk
 
-        window_size = 74
-        center = window_size / 2
+        window_width = int(OVERLAY_WINDOW_WIDTH)
+        window_height = int(OVERLAY_WINDOW_HEIGHT)
+        center_y = window_height / 2
         bg_key = "#010203"
 
         root = tk.Tk()
         root.overrideredirect(True)
         root.attributes("-topmost", True)
-        root.geometry(f"{window_size}x{window_size}+0+0")
+        root.geometry(f"{window_width}x{window_height}+{int(OVERLAY_MARGIN_X)}+{int(OVERLAY_MARGIN_Y)}")
         root.configure(bg=bg_key)
         root.attributes("-alpha", 0.0)
         root.lift()
@@ -466,35 +472,63 @@ class RecordingOverlay:
 
         canvas = tk.Canvas(
             root,
-            width=window_size,
-            height=window_size,
+            width=window_width,
+            height=window_height,
             highlightthickness=0,
             bd=0,
             bg=bg_key,
         )
         canvas.pack()
 
-        aura_id = canvas.create_oval(0, 0, 0, 0, fill="#0a1016", outline="", state="hidden")
-        halo_id = canvas.create_oval(0, 0, 0, 0, fill="#1a222d", outline="#9ca7b5", width=1, state="hidden")
-        shell_id = canvas.create_oval(0, 0, 0, 0, fill="#27313d", outline="#6f7a89", width=1, state="hidden")
+        pill_id = canvas.create_rectangle(
+            0,
+            0,
+            window_width,
+            window_height,
+            fill=OVERLAY_BACKGROUND_FILL,
+            outline="",
+            state="hidden",
+        )
+
         dot_id = canvas.create_oval(0, 0, 0, 0, fill="#ba2640", outline="#ee788a", width=1, state="hidden")
-        clipboard_body_id = canvas.create_rectangle(0, 0, 0, 0, fill="#d2d9e1", outline="#f7fbff", width=1, state="hidden")
-        clipboard_clip_id = canvas.create_rectangle(0, 0, 0, 0, fill="#b7c1cb", outline="#edf2f7", width=1, state="hidden")
-        clipboard_line_ids = [
-            canvas.create_line(0, 0, 0, 0, fill="#8f99a6", width=1, capstyle=tk.ROUND, state="hidden"),
-            canvas.create_line(0, 0, 0, 0, fill="#a0aab6", width=1, capstyle=tk.ROUND, state="hidden"),
+        label_id = canvas.create_text(
+            OVERLAY_LABEL_X,
+            center_y + OVERLAY_LABEL_Y_OFFSET,
+            anchor="w",
+            fill="#ffffff",
+            font=(OVERLAY_LABEL_FONT_NAME, int(OVERLAY_LABEL_FONT_SIZE)),
+            text=OVERLAY_LABEL_TEXT,
+            state="hidden",
+        )
+        wave_dot_ids = [
+            canvas.create_oval(0, 0, 0, 0, fill="#ffffff", outline="", state="hidden")
+            for _ in range(OVERLAY_WAVE_DOT_COUNT)
         ]
 
-        state = "hidden"
-        visibility = 0.0
+        state = "ready"
+        state_elapsed = 0.0
         phase = 0.0
-        idle_hold_frames = 0
+        is_hovered = False
 
-        def set_circle(item_id, radius: float, cx: float = center, cy: float = center) -> None:
+        def set_circle(item_id, radius: float, cx: float = OVERLAY_DOT_CENTER_X, cy: float = center_y) -> None:
             canvas.coords(item_id, cx - radius, cy - radius, cx + radius, cy + radius)
 
+        def set_hover_state(next_hover_state: bool) -> None:
+            nonlocal is_hovered
+            is_hovered = next_hover_state
+
+        def handle_click(_event) -> None:
+            try:
+                event_queue.put_nowait("toggle")
+            except Exception:
+                pass
+
+        canvas.bind("<Enter>", lambda _event: set_hover_state(True))
+        canvas.bind("<Leave>", lambda _event: set_hover_state(False))
+        canvas.bind("<Button-1>", handle_click)
+
         def tick() -> None:
-            nonlocal state, visibility, phase, idle_hold_frames
+            nonlocal state, state_elapsed, phase
 
             while True:
                 try:
@@ -504,112 +538,97 @@ class RecordingOverlay:
                 if next_state == "__quit__":
                     root.destroy()
                     return
-                if next_state in {"recording", "transcribing"}:
-                    state = next_state
-                    idle_hold_frames = 0
-                elif next_state == "saved":
-                    state = "saved"
-                    idle_hold_frames = 24
+                if next_state in {"ready", "recording", "transcribing"}:
+                    resolved_state = next_state
                 else:
-                    state = "idle"
-                    idle_hold_frames = 0
+                    resolved_state = "ready"
+                if resolved_state != state:
+                    state = resolved_state
+                    state_elapsed = 0.0
 
-            if state in {"recording", "transcribing"}:
-                target_visibility = 1.0
-            elif state == "saved" and idle_hold_frames > 0:
-                idle_hold_frames -= 1
-                target_visibility = 1.0
-            else:
-                target_visibility = 0.0
-                if visibility < 0.03:
-                    state = "hidden"
-
-            if target_visibility > visibility:
-                visibility += (target_visibility - visibility) * 0.20
-            else:
-                visibility += (target_visibility - visibility) * 0.12
-            visibility = max(0.0, min(1.0, visibility))
+            state_elapsed += OVERLAY_STATE_STEP_SECONDS
             phase += 0.10
 
-            if state == "hidden" and visibility < 0.02:
-                canvas.itemconfigure(aura_id, state="hidden")
-                canvas.itemconfigure(halo_id, state="hidden")
-                canvas.itemconfigure(shell_id, state="hidden")
-                canvas.itemconfigure(dot_id, state="hidden")
-                canvas.itemconfigure(clipboard_body_id, state="hidden")
-                canvas.itemconfigure(clipboard_clip_id, state="hidden")
-                for line_id in clipboard_line_ids:
-                    canvas.itemconfigure(line_id, state="hidden")
-                root.attributes("-alpha", 0.0)
-                root.after(33, tick)
-                return
-
-            scale = 0.18 + 0.82 * (1.0 - pow(1.0 - visibility, 3))
+            pill_width = overlay_pill_width(state, state_elapsed)
+            dot_scale = 1.0
             if state == "recording":
-                scale *= 1.0 + 0.012 * math.sin(phase * 1.05)
+                visual_elapsed = overlay_recording_visual_elapsed(state_elapsed)
+                intro_progress = 1.0 - math.exp(-visual_elapsed * OVERLAY_RECORDING_INTRO_SPEED)
+                intro_scale = OVERLAY_RECORDING_INTRO_MIN_SCALE + (1.0 - OVERLAY_RECORDING_INTRO_MIN_SCALE) * intro_progress
+                settle_scale = 1.0 + OVERLAY_RECORDING_SETTLE_AMPLITUDE * math.exp(
+                    -visual_elapsed * OVERLAY_RECORDING_SETTLE_DAMPING
+                ) * math.sin(visual_elapsed * OVERLAY_RECORDING_SETTLE_FREQUENCY)
+                breath_scale = 1.0 + 0.020 * math.sin(phase * 1.05)
+                dot_scale *= intro_scale * settle_scale * breath_scale
             elif state == "transcribing":
-                scale *= 1.0 + 0.006 * math.sin(phase * 0.85)
-            elif state == "saved":
-                scale *= 0.74
+                dot_scale *= 1.0 + 0.012 * math.sin(phase * 0.75)
+            else:
+                dot_scale *= 1.0 + 0.010 * math.sin(phase * 0.55)
 
-            set_circle(aura_id, 24.0 * scale)
-            set_circle(halo_id, 19.5 * scale)
-            set_circle(shell_id, 14.6 * scale)
-            canvas.itemconfigure(halo_id, state="normal")
-            canvas.itemconfigure(shell_id, state="normal")
-            canvas.itemconfigure(aura_id, state="normal")
-            canvas.itemconfigure(dot_id, state="hidden")
-            canvas.itemconfigure(clipboard_body_id, state="hidden")
-            canvas.itemconfigure(clipboard_clip_id, state="hidden")
-            for line_id in clipboard_line_ids:
-                canvas.itemconfigure(line_id, state="hidden")
+            style = overlay_style(state)
+            background_alpha = OVERLAY_HOVER_ALPHA if is_hovered else OVERLAY_BACKGROUND_ALPHA
 
-            if state == "recording":
-                set_circle(dot_id, 8.5 * scale)
-                canvas.itemconfigure(dot_id, fill="#ba2640", outline="#ee788a", state="normal")
-            elif state == "transcribing":
-                set_circle(dot_id, 8.5 * scale)
-                canvas.itemconfigure(dot_id, fill="#61121f", outline="#d65e72", state="normal")
-            elif state == "saved":
-                body_width = 14.0 * scale
-                body_height = 16.0 * scale
-                body_x1 = center - body_width / 2
-                body_y1 = center - body_height / 2 - 0.8 * scale
-                body_x2 = center + body_width / 2
-                body_y2 = body_y1 + body_height
-                clip_width = 8.0 * scale
-                clip_height = 4.3 * scale
-                clip_x1 = center - clip_width / 2
-                clip_y1 = body_y2 - 1.5 * scale
-                clip_x2 = center + clip_width / 2
-                clip_y2 = clip_y1 + clip_height
+            canvas.itemconfigure(pill_id, state="normal")
+            canvas.coords(pill_id, 0, 0, pill_width, window_height)
+            set_circle(dot_id, OVERLAY_DOT_RADIUS * dot_scale)
+            canvas.itemconfigure(dot_id, fill=style["fill"], outline="", state="normal")
+            canvas.itemconfigure(label_id, fill="#ffffff", state="normal")
+            if overlay_wave_visible(state, state_elapsed):
+                for index, wave_dot_id in enumerate(wave_dot_ids):
+                    envelope = 0.35 + 0.65 * math.sin((index + 1) / (OVERLAY_WAVE_DOT_COUNT + 1) * math.pi)
+                    travel = phase * 1.9 - index * 0.55
+                    lift = math.sin(travel) * OVERLAY_WAVE_MAX_OFFSET * envelope
+                    intensity = 0.28 + 0.46 * (0.5 + 0.5 * math.sin(travel + 0.9)) * envelope
+                    radius = OVERLAY_WAVE_MIN_RADIUS + (OVERLAY_WAVE_MAX_RADIUS - OVERLAY_WAVE_MIN_RADIUS) * intensity
+                    x = OVERLAY_WAVE_START_X + index * OVERLAY_WAVE_DOT_SPACING
+                    y = center_y + lift
+                    shade = int(170 + 70 * intensity)
+                    canvas.coords(wave_dot_id, x - radius, y - radius, x + radius, y + radius)
+                    canvas.itemconfigure(wave_dot_id, fill=f"#{shade:02x}{shade:02x}{shade:02x}", state="normal")
+            else:
+                for wave_dot_id in wave_dot_ids:
+                    canvas.itemconfigure(wave_dot_id, state="hidden")
 
-                canvas.coords(clipboard_body_id, body_x1, body_y1, body_x2, body_y2)
-                canvas.coords(clipboard_clip_id, clip_x1, clip_y1, clip_x2, clip_y2)
-                canvas.itemconfigure(clipboard_body_id, state="normal")
-                canvas.itemconfigure(clipboard_clip_id, state="normal")
-                canvas.coords(
-                    clipboard_line_ids[0],
-                    body_x1 + 3.2 * scale,
-                    body_y1 + 5.5 * scale,
-                    body_x2 - 3.2 * scale,
-                    body_y1 + 5.5 * scale,
-                )
-                canvas.coords(
-                    clipboard_line_ids[1],
-                    body_x1 + 3.2 * scale,
-                    body_y1 + 9.1 * scale,
-                    body_x2 - 4.2 * scale,
-                    body_y1 + 9.1 * scale,
-                )
-                for line_id in clipboard_line_ids:
-                    canvas.itemconfigure(line_id, state="normal")
-
-            root.attributes("-alpha", round(min(0.93, pow(visibility, 0.86)), 3))
+            root.attributes("-alpha", background_alpha)
             root.after(33, tick)
 
         tick()
         root.mainloop()
+
+
+def ensure_overlay_running() -> None:
+    global overlay, overlay_event_thread
+    with overlay_lock:
+        if overlay is not None and overlay.is_available():
+            return
+        try:
+            candidate = RecordingOverlay()
+        except Exception:
+            overlay = None
+            return
+        overlay = candidate if candidate.is_available() else None
+        if overlay is not None:
+            overlay_event_thread = threading.Thread(target=bridge_overlay_events, args=(overlay,), daemon=True)
+            overlay_event_thread.start()
+
+
+def set_overlay_state(state: str) -> None:
+    ensure_overlay_running()
+    with overlay_lock:
+        if overlay is None or not overlay.is_available():
+            return
+        overlay.set_state(state)
+
+
+def bridge_overlay_events(active_overlay: RecordingOverlay) -> None:
+    while active_overlay.is_available():
+        event = active_overlay.get_event(timeout=0.25)
+        if event != "toggle":
+            continue
+        try:
+            toggle_recording()
+        except Exception as exc:
+            print(f"Error toggling recording: {exc}")
 
 
 def resolve_input_device():
@@ -655,6 +674,8 @@ def applescript_escape(value: str) -> str:
 
 
 def notify(title: str, message: str) -> None:
+    if not ENABLE_SYSTEM_NOTIFICATIONS:
+        return
     try:
         safe_title = applescript_escape(title)
         safe_message = applescript_escape(message)
@@ -770,6 +791,11 @@ def close_input_stream() -> None:
     except Exception:
         pass
 
+    try:
+        sd.stop(ignore_errors=True)
+    except Exception:
+        pass
+
 
 def start_recording() -> None:
     global is_recording, audio_chunks
@@ -785,17 +811,13 @@ def start_recording() -> None:
     except Exception as exc:
         is_recording = False
         close_input_stream()
-        if overlay is not None:
-            overlay.set_state("idle")
+        set_overlay_state("ready")
         print(f"Could not start audio input: {exc}")
         notify("Dictation", "Could not access microphone")
         return
 
-    if overlay is not None:
-        overlay.set_state("recording")
+    set_overlay_state("recording")
     play_chime("start")
-    if overlay is None:
-        notify("Recording...", "Speak now.")
     print("Recording started. Speak now...")
 
 
@@ -809,15 +831,11 @@ def stop_recording_and_transcribe() -> None:
     if not is_recording or is_transcribing:
         return
 
-    saved_to_clipboard = False
     is_recording = False
     close_input_stream()
     is_transcribing = True
-    if overlay is not None:
-        overlay.set_state("transcribing")
+    set_overlay_state("transcribing")
     play_chime("stop")
-    if overlay is None:
-        notify("Dictation", "Transcribing")
     print("Transcribing...")
 
     try:
@@ -869,10 +887,7 @@ def stop_recording_and_transcribe() -> None:
                 return
 
             pyperclip.copy(text)
-            saved_to_clipboard = True
             print(f"\nTranscript:\n{text}\n")
-            if overlay is None:
-                notify("Dictation", "Copied to clipboard")
 
             if AUTO_PASTE:
                 paste_clipboard()
@@ -884,8 +899,16 @@ def stop_recording_and_transcribe() -> None:
                 pass
     finally:
         is_transcribing = False
-        if overlay is not None:
-            overlay.set_state("saved" if saved_to_clipboard else "idle")
+        set_overlay_state("ready")
+
+
+def toggle_recording() -> None:
+    if is_transcribing:
+        return
+    if is_recording:
+        threading.Thread(target=stop_recording_and_transcribe, daemon=True).start()
+        return
+    start_recording()
 
 
 def is_left_shift(key) -> bool:
@@ -920,10 +943,7 @@ def on_release(key):
         shift_l_down = False
         shift_r_down = False
         try:
-            if is_recording:
-                threading.Thread(target=stop_recording_and_transcribe, daemon=True).start()
-            else:
-                start_recording()
+            toggle_recording()
         except Exception as e:
             print(f"Error toggling recording: {e}")
         return
@@ -957,16 +977,11 @@ def ensure_accessibility_permissions() -> bool:
 
 
 def main() -> None:
-    global overlay
     if not ensure_accessibility_permissions():
         return
 
-    try:
-        overlay = RecordingOverlay()
-        if not overlay.is_available():
-            overlay = None
-    except Exception:
-        overlay = None
+    ensure_overlay_running()
+    set_overlay_state("ready")
 
     load_model()
 
@@ -979,10 +994,10 @@ def main() -> None:
     print("Start recording: hold Left Shift + Right Shift, then release both.")
     print("Stop recording: hold Left Shift + Right Shift, then release either Shift key.")
     print("Transcript is copied to clipboard and auto-pasted (Cmd+V).")
-    if overlay is not None:
-        print("Visual indicator: animated top-left recording badge.")
+    if overlay is not None and overlay.is_available():
+        print("Visual indicator: status pill on the main display.")
     else:
-        print("Visual indicator unavailable: tkinter/_tkinter not present in this Python build.")
+        print("Visual indicator unavailable.")
 
     try:
         with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
@@ -991,8 +1006,9 @@ def main() -> None:
         print("\nExiting.")
     finally:
         close_input_stream()
-        if overlay is not None:
-            overlay.close()
+        with overlay_lock:
+            if overlay is not None:
+                overlay.close()
 
 
 if __name__ == "__main__":
